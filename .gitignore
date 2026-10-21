@@ -1,0 +1,16 @@
+# 嵌套的上游克隆（各自独立版本管理）
+/Kwrt/
+/op-packages/
+/openwrt-src/
+
+# Agent 工作区状态
+/.workbuddy/
+
+# 可再生的大体积分析产物（用 extract_ib.py / extract_rootfs.py 重新提取）
+/ib-.packageinfo
+/ib-.targetinfo
+/ib-.config
+
+# Python
+__pycache__/
+*.pyc
