@@ -280,3 +280,49 @@ config mcp 'global'
 - ramanarupa/mcp-openwrt、subashgautam/router-mcp（工具面与安全分层参考）
 - OpenWrt 论坛 Oasis/OLT：路由器侧工具层的 ubus 实现先例
 - 本项目前置文档：《Kwrt精简固件方案.md》（构建体系、op-packages feed、风险清单）
+
+---
+
+## 11. 落地执行记录（2026-07）
+
+按 §8 集成方案落地为独立包 `mcp-routerd`，提交至 Kwrt 仓库
+`devices/common/diy/package/mcp-routerd/`（`diy/` 覆盖层机制，无需 fork feed）。
+
+### 交付物
+| 文件 | 说明 |
+|---|---|
+| `Makefile` | OpenWrt 包定义，`DEPENDS` 引入 ucode 及 ubus/uci/socket/fs/log 模块 |
+| `files/usr/bin/mcp-routerd` | 主程序（约 560 行 ucode），HTTP + JSON-RPC 2.0 + 工具层 |
+| `files/etc/init.d/mcp-routerd` | procd 守护（`START=95`，respawn） |
+| `files/etc/config/mcp` | UCI 默认配置（listen/token/allow_write/audit） |
+| `files/etc/uci-defaults/99-mcp-routerd` | 首次启动生成 token、写 banner 提示、修复 nginx include |
+| `files/etc/nginx/conf.d/mcp-routerd.locations` | `/mcp` 反代注入（沿用 `_lan` 的 LAN 限制） |
+
+### 实现要点（与 §6 的偏差说明）
+- **协议**：仅实现稳定核心子集 `initialize`/`ping`/`tools/list`/`tools/call`；
+  `notifications/*` 返回 202 空体；支持批量数组；`initialize` 回显客户端
+  `protocolVersion`，缺省回退 `2025-06-18`。
+- **工具面**：共 14 个 —— 8 个 L0 只读（system_info/network_status/wifi_status/
+  wifi_scan/list_clients/firewall_rules/dns_query_log/read_log）+ 6 个 L1 写
+  （set_wifi/set_dhcp_lease/add_firewall_rule/remove_firewall_rule/
+  restart_service/reboot）。比 §6.2 初稿多拆出 `remove_firewall_rule`。
+- **写防护**：`uci mcp.global.allow_write=1` 开关 **且** `arguments.confirm: true`
+  双重校验，缺一即拒绝并审计。L2 原始 shell 按方案不实现。
+- **审计**：每次 tools/call 经 `log.syslog` 记录（printf 格式对不可信参数用 `%s`
+  包裹，防格式串问题）；软失败 `{error: ...}` 归一化为协议级 `isError: true`。
+- **部署**：监听默认 `127.0.0.1:8765`；nginx-ssl 的 `_lan` server 自动 include
+  `conf.d/*.locations`，故单文件即完成 `/mcp` 反代挂载，HTTPS 与 LAN 限制免费获得。
+
+### 验证
+- 本地构建 ucode 解释器 + fs/socket/log 模块，ubus/uci 以 stub 模块替代，
+  完整跑通协议路径：鉴权（401）→ initialize → tools/list → tools/call
+  → 写工具双重拦截 → 通知 202 → 批量请求 → 解析错误 -32700 → 405/404。全部通过。
+- `ucode -c` 编译检查通过。
+- Git 侧以 `.gitattributes` 强制 `eol=lf`，规避 Windows autocrlf 破坏脚本换行。
+
+### 构建与客户端接入
+- 提交 `b804cfb4`（Kwrt 仓库 → jianjunx/jwrt `main`），GitHub Actions
+  `Openwrt-AutoBuild.yml`（target=mediatek_filogic，param=nocache）已触发，
+  run 39646379803。
+- 固件刷入后：token 在 `/etc/config/mcp` 或 `logread | grep mcp-routerd` 获取，
+  客户端配置见附录 A。
