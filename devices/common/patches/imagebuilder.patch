@@ -118,17 +118,17 @@
 +		XSMALL_FLASH := true
 +	endif
 +endif
-+ifneq ($(findstring usb,$(BUILD_PACKAGES)),)
-+	ifneq ($(XSMALL_FLASH),true)
-+		BUILD_PACKAGES += automount luci-app-diskman
-+	endif
-+endif
++#ifneq ($(findstring usb,$(BUILD_PACKAGES)),)
++#	ifneq ($(XSMALL_FLASH),true)
++#		BUILD_PACKAGES += automount luci-app-diskman
++#	endif
++#endif
 +ifeq ($(SMALL_FLASH),true)
 +	ifeq ($(shell grep -q small_flash $(TOPDIR)/repositories.conf || echo "not_found"),not_found)
 +        $(shell echo "`grep kwrt_kiddin9 $(TOPDIR)/repositories.conf | sed -e 's/kiddin9/small_flash/g'`" >>$(TOPDIR)/repositories.conf)
 +	endif
 +	ifneq ($(findstring /www/wwwroot/,$(BIN_DIR)),)
-+		BUILD_PACKAGES += -luci-app-istorex -htop -bash -openssh-sftp-server -luci-nginx luci-ssl
++		BUILD_PACKAGES += -htop -bash -openssh-sftp-server -luci-nginx luci-ssl
 +	endif
 +else
 +        $(shell sed -i "/small_flash/d" $(TOPDIR)/repositories.conf)
