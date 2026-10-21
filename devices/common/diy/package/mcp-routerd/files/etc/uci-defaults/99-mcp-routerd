@@ -1,0 +1,31 @@
+#!/bin/sh
+# mcp-routerd first-boot setup: token generation + nginx endpoint registration.
+
+# 1) Generate a random MCP access token if not configured.
+if [ -z "$(uci -q get mcp.global.token)" ]; then
+	token="$(head -c 32 /dev/urandom | md5sum | cut -d' ' -f1)"
+	uci set mcp.global.token="$token"
+	uci commit mcp
+
+	# make the token easy to discover on first login
+	{
+		echo ""
+		echo "  MCP (AI agent) access token:"
+		echo "    uci get mcp.global.token"
+		echo ""
+	} >> /etc/banner
+fi
+
+# 2) Ensure the nginx LAN server includes conf.d/*.locations (upstream default,
+#    but re-add it in case the config was customised without the wildcard).
+if uci -q get nginx._lan >/dev/null 2>&1; then
+	if ! uci -q get nginx._lan.include | grep -q 'conf.d/\*\.locations'; then
+		uci add_list nginx._lan.include='conf.d/*.locations'
+		uci commit nginx
+	fi
+
+	# apply if nginx is already running (fresh boot: starts later and picks it up)
+	[ -x /etc/init.d/nginx ] && /etc/init.d/nginx enabled && /etc/init.d/nginx reload 2>/dev/null
+fi
+
+exit 0

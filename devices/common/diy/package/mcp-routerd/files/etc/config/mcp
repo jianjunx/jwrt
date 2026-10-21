@@ -1,0 +1,7 @@
+config mcp 'global'
+	option enabled '1'
+	option listen '127.0.0.1:8765'
+	option token ''
+	option allow_write '0'
+	option allow_exec '0'
+	option audit '1'

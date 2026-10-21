@@ -1,0 +1,12 @@
+# 强制 shell / Makefile / 配置文件使用 LF 行尾（本机 core.autocrlf=true，
+# CRLF 脚本在 Linux 构建机上会报 `set: pipefail: 无效的选项名` 或 patch 失败）
+*.sh        text eol=lf
+*.init      text eol=lf
+Makefile    text eol=lf
+*.mk        text eol=lf
+*.patch     text eol=lf
+*.locations text eol=lf
+*.uc        text eol=lf
+files/etc/init.d/*      text eol=lf
+files/etc/uci-defaults/* text eol=lf
+files/etc/config/*      text eol=lf

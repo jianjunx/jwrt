@@ -1,0 +1,919 @@
+#!/usr/bin/ucode
+/*
+ * mcp-routerd - MCP (Model Context Protocol) server for OpenWrt routers
+ *
+ * Exposes router capabilities as MCP tools over HTTP + JSON-RPC 2.0 so AI
+ * agents (WorkBuddy, Claude, generic MCP clients) can query and manage the
+ * router. Implements the stable protocol core only:
+ *   initialize / ping / tools/list / tools/call
+ *
+ * Security model (see MCP功能可行性分析.md §6.3):
+ *   - Bearer token auth (never cookie auth -> immune to CSRF)
+ *   - default listen 127.0.0.1:8765 behind nginx-ssl (/mcp reverse proxy)
+ *   - L0 read-only tools always on; L1 write tools behind uci allow_write
+ *     and an explicit arguments.confirm=true; L2 raw shell is NOT implemented
+ *   - every tools/call is audited via syslog (logread | grep mcp-audit)
+ */
+
+import * as socket from 'socket';
+import * as fs from 'fs';
+import * as log from 'log';
+import * as ubus from 'ubus';
+import * as uci from 'uci';
+
+let VERSION = '1.0.0';
+let PROTOCOL_FALLBACK = '2025-06-18';
+let MAX_HEADER = 65536;
+let MAX_BODY = 1048576;
+let READ_TIMEOUT = 30000;
+
+let cfg = {
+	enabled: true,
+	listen: '127.0.0.1:8765',
+	token: '',
+	allow_write: false,
+	audit: true
+};
+
+/* ------------------------------------------------------------------ */
+/* helpers                                                            */
+/* ------------------------------------------------------------------ */
+
+function ts() {
+	let t = localtime(time());
+	return sprintf('%04d-%02d-%02d %02d:%02d:%02d',
+		t.year, t.mon, t.mday, t.hour, t.min, t.sec);
+}
+
+function audit(line) {
+	if (!cfg.audit)
+		return;
+	log.syslog(log.LOG_INFO, '%s', 'mcp-audit: ' + ts() + ' ' + line);
+}
+
+function truncate(s, n) {
+	s = '' + s;
+	return length(s) > n ? substr(s, 0, n) + '...' : s;
+}
+
+function clamp_int(v, lo, hi, def) {
+	if (type(v) == 'double')
+		v = int(v);
+	if (type(v) != 'int')
+		return def;
+	if (v < lo)
+		return lo;
+	if (v > hi)
+		return hi;
+	return v;
+}
+
+/* run a command without a shell (array form -> execvp, injection-safe) */
+function run(cmd) {
+	let proc = fs.popen(cmd, 'r');
+	if (proc == null)
+		return null;
+	let out = proc.read('all');
+	proc.close();
+	return out;
+}
+
+/* ------------------------------------------------------------------ */
+/* ubus / uci access                                                  */
+/* ------------------------------------------------------------------ */
+
+let uconn = null;
+
+function uc(obj, meth, args) {
+	if (uconn == null) {
+		try {
+			uconn = ubus.connect();
+		} catch (e) {
+			return null;
+		}
+		if (uconn == null)
+			return null;
+	}
+	try {
+		return (args == null) ? uconn.call(obj, meth) : uconn.call(obj, meth, args);
+	} catch (e) {
+		return null;
+	}
+}
+
+function cursor() {
+	try {
+		return uci.cursor();
+	} catch (e) {
+		return null;
+	}
+}
+
+/* ------------------------------------------------------------------ */
+/* configuration                                                      */
+/* ------------------------------------------------------------------ */
+
+function load_config() {
+	let ctx = cursor();
+	if (ctx == null)
+		die('mcp-routerd: cannot create uci cursor');
+
+	let g = ctx.get_all('mcp', 'global');
+	if (type(g) != 'object')
+		die('mcp-routerd: missing /etc/config/mcp "global" section');
+
+	cfg.enabled = (g.enabled != '0');
+	cfg.listen = (type(g.listen) == 'string' && g.listen != '') ? g.listen : '127.0.0.1:8765';
+	cfg.token = (type(g.token) == 'string') ? g.token : '';
+	cfg.allow_write = (g.allow_write == '1');
+	cfg.audit = (g.audit != '0');
+}
+
+function ensure_token() {
+	if (cfg.token != '')
+		return;
+
+	/* hardcoded argv, no shell interpolation - injection-safe */
+	let proc = fs.popen([ '/bin/sh', '-c', 'head -c 32 /dev/urandom | md5sum | cut -d" " -f1' ], 'r');
+	if (proc == null)
+		die('mcp-routerd: cannot generate token');
+	let t = trim(proc.read('all'));
+	proc.close();
+
+	if (t == '')
+		die('mcp-routerd: token generation produced empty string');
+
+	cfg.token = t;
+	let ctx = cursor();
+	if (ctx != null) {
+		ctx.set('mcp', 'global', 'token', t);
+		ctx.commit('mcp');
+	}
+	log.syslog(log.LOG_WARNING, '%s', 'mcp-routerd: generated new access token (retrieve: uci get mcp.global.token)');
+}
+
+/* ------------------------------------------------------------------ */
+/* auth                                                               */
+/* ------------------------------------------------------------------ */
+
+function auth_ok(headers) {
+	let a = headers['authorization'];
+	if (type(a) != 'string' || length(a) < 8)
+		return false;
+	if (lc(substr(a, 0, 7)) != 'bearer ')
+		return false;
+	let t = trim(substr(a, 7));
+	return (t != '' && cfg.token != '' && t == cfg.token);
+}
+
+/* ------------------------------------------------------------------ */
+/* JSON-RPC envelope                                                  */
+/* ------------------------------------------------------------------ */
+
+function rpc_ok(id, result) {
+	return { jsonrpc: '2.0', id: id, result: result };
+}
+
+function rpc_err(id, code, message) {
+	return { jsonrpc: '2.0', id: id, error: { code: code, message: message } };
+}
+
+function tool_ok(data) {
+	let text = (type(data) == 'string') ? data : sprintf('%2J', data);
+	return { content: [ { type: 'text', text: text } ], isError: false };
+}
+
+function tool_err(msg) {
+	return { content: [ { type: 'text', text: '' + msg } ], isError: true };
+}
+
+/* ------------------------------------------------------------------ */
+/* tool registry                                                      */
+/* ------------------------------------------------------------------ */
+
+let SERVICE_CMDS = {
+	network: [ '/etc/init.d/network', 'restart' ],
+	dnsmasq: [ '/etc/init.d/dnsmasq', 'restart' ],
+	firewall: [ '/etc/init.d/firewall', 'reload' ],
+	wireless: [ '/sbin/wifi', 'reload' ]
+};
+
+let tools = {
+
+	/* ---------------- L0: read-only ---------------- */
+
+	system_info: {
+		desc: 'Router model, kernel, hostname, uptime, load and memory usage.',
+		write: false,
+		schema: { type: 'object', properties: {} },
+		run: function(args) {
+			return {
+				board: uc('system', 'board'),
+				info: uc('system', 'info')
+			};
+		}
+	},
+
+	network_status: {
+		desc: 'WAN/LAN/VPN interface state, addresses, routes and device statistics.',
+		write: false,
+		schema: { type: 'object', properties: {} },
+		run: function(args) {
+			return {
+				interfaces: uc('network.interface', 'dump'),
+				devices: uc('network.device', 'dump')
+			};
+		}
+	},
+
+	wifi_status: {
+		desc: 'Wireless radios and interfaces: SSID, channel, mode, encryption, clients count.',
+		write: false,
+		schema: { type: 'object', properties: {} },
+		run: function(args) {
+			return uc('network.wireless', 'status');
+		}
+	},
+
+	wifi_scan: {
+		desc: 'Scan neighbouring WiFi networks. Optionally limit to one interface via "device".',
+		write: false,
+		schema: {
+			type: 'object',
+			properties: {
+				device: { type: 'string', description: 'Wireless interface name, e.g. wlan0 (optional)' }
+			}
+		},
+		run: function(args) {
+			let st = uc('network.wireless', 'status');
+			let dev = (type(args.device) == 'string') ? args.device : null;
+			let out = {};
+			let scanned = 0;
+
+			if (type(st) == 'object') {
+				for (let radio in st) {
+					let r = st[radio];
+					let ifaces = (type(r) == 'object' && type(r.interfaces) == 'array') ? r.interfaces : [];
+					for (let i = 0; i < length(ifaces); i++) {
+						let ifn = ifaces[i].ifname;
+						if (type(ifn) != 'string')
+							continue;
+						if (dev != null && dev != ifn)
+							continue;
+						let res = uc('iwinfo', 'scan', { device: ifn });
+						if (res == null)
+							res = uc('iwinfo.' + ifn, 'scan', {});
+						out[ifn] = (res != null) ? res : { error: 'iwinfo scan unavailable' };
+						scanned++;
+					}
+				}
+			}
+
+			if (scanned == 0)
+				return { error: 'no matching wireless interfaces found' };
+			return out;
+		}
+	},
+
+	list_clients: {
+		desc: 'Known and online LAN clients: hostname, IP, MAC, from DHCP leases and host hints.',
+		write: false,
+		schema: { type: 'object', properties: {} },
+		run: function(args) {
+			let leases = [];
+			let raw = fs.readfile('/tmp/dhcp.leases');
+			if (type(raw) == 'string') {
+				let lines = split(raw, '\n');
+				for (let i = 0; i < length(lines); i++) {
+					let f = split(lines[i], ' ');
+					if (length(f) >= 4 && f[1] != '')
+						push(leases, { expires: f[0], mac: f[1], ip: f[2], hostname: f[3] });
+				}
+			}
+			return {
+				hosts: uc('luci-rpc', 'getHostHints', {}),
+				leases: leases
+			};
+		}
+	},
+
+	firewall_rules: {
+		desc: 'Full firewall configuration (zones, forwards, rules, redirects) from uci.',
+		write: false,
+		schema: { type: 'object', properties: {} },
+		run: function(args) {
+			let ctx = cursor();
+			if (ctx == null)
+				return { error: 'uci unavailable' };
+			return ctx.get_all('firewall');
+		}
+	},
+
+	dns_query_log: {
+		desc: 'Recent dnsmasq log lines (DHCPACK, queries) from the system log.',
+		write: false,
+		schema: {
+			type: 'object',
+			properties: {
+				limit: { type: 'integer', description: 'Max lines to return (1-500, default 50)' }
+			}
+		},
+		run: function(args) {
+			let limit = clamp_int(args.limit, 1, 500, 50);
+			let out = run([ 'logread' ]);
+			if (type(out) != 'string')
+				return { error: 'logread failed' };
+			let lines = split(out, '\n');
+			let hits = [];
+			for (let i = length(lines) - 1; i >= 0 && length(hits) < limit; i--) {
+				if (index(lines[i], 'dnsmasq') >= 0)
+					push(hits, lines[i]);
+			}
+			return { lines: reverse(hits) };
+		}
+	},
+
+	read_log: {
+		desc: 'Read the system log (logread), newest last. Optionally filter by substring.',
+		write: false,
+		schema: {
+			type: 'object',
+			properties: {
+				filter: { type: 'string', description: 'Only lines containing this substring (optional)' },
+				limit: { type: 'integer', description: 'Max lines to return (1-500, default 100)' }
+			}
+		},
+		run: function(args) {
+			let limit = clamp_int(args.limit, 1, 500, 100);
+			let filter = (type(args.filter) == 'string') ? args.filter : null;
+			let out = run([ 'logread' ]);
+			if (type(out) != 'string')
+				return { error: 'logread failed' };
+			let lines = split(out, '\n');
+			let hits = [];
+			for (let i = length(lines) - 1; i >= 0 && length(hits) < limit; i--) {
+				if (filter == null || index(lines[i], filter) >= 0)
+					push(hits, lines[i]);
+			}
+			return { lines: reverse(hits) };
+		}
+	},
+
+	/* ---------------- L1: write (allow_write + confirm) ---------------- */
+
+	set_wifi: {
+		desc: 'Set SSID / WPA key / channel on a wifi-iface section (needs confirm:true).',
+		write: true,
+		schema: {
+			type: 'object',
+			properties: {
+				section: { type: 'string', description: 'uci section name of the wifi-iface (see: uci show wireless)' },
+				ssid: { type: 'string', description: 'New SSID' },
+				key: { type: 'string', description: 'New WPA key/passphrase' },
+				channel: { type: 'integer', description: 'New channel (applied to the parent radio)' },
+				confirm: { type: 'boolean', description: 'Must be true' }
+			},
+			required: [ 'section', 'confirm' ]
+		},
+		run: function(args) {
+			if (args.confirm !== true)
+				return { error: 'this operation requires arguments.confirm=true' };
+
+			let sect = args.section;
+			if (type(sect) != 'string' || sect == '')
+				return { error: 'missing "section"' };
+
+			let ctx = cursor();
+			if (ctx == null)
+				return { error: 'uci unavailable' };
+
+			if (ctx.get('wireless', sect) != 'wifi-iface')
+				return { error: 'section "' + sect + '" is not a wifi-iface (or missing)' };
+
+			let changed = [];
+			if (type(args.ssid) == 'string' && args.ssid != '') {
+				ctx.set('wireless', sect, 'ssid', args.ssid);
+				push(changed, 'ssid');
+			}
+			if (type(args.key) == 'string' && args.key != '') {
+				ctx.set('wireless', sect, 'key', args.key);
+				push(changed, 'key');
+			}
+			if (args.channel != null) {
+				let dev = ctx.get('wireless', sect, 'device');
+				if (type(dev) == 'string' && dev != '') {
+					ctx.set('wireless', dev, 'channel', sprintf('%d', args.channel));
+					push(changed, 'channel');
+				}
+			}
+			if (length(changed) == 0)
+				return { error: 'nothing to change (provide ssid, key or channel)' };
+
+			ctx.commit('wireless');
+			run([ '/sbin/wifi', 'reload' ]);
+			return { ok: true, section: sect, changed: changed };
+		}
+	},
+
+	set_dhcp_lease: {
+		desc: 'Add a static DHCP lease (MAC->IP binding). Requires confirm:true.',
+		write: true,
+		schema: {
+			type: 'object',
+			properties: {
+				mac: { type: 'string', description: 'Client MAC address' },
+				ip: { type: 'string', description: 'Static IPv4 address' },
+				name: { type: 'string', description: 'Hostname label (optional)' },
+				confirm: { type: 'boolean', description: 'Must be true' }
+			},
+			required: [ 'mac', 'ip', 'confirm' ]
+		},
+		run: function(args) {
+			if (args.confirm !== true)
+				return { error: 'this operation requires arguments.confirm=true' };
+
+			let mac = (type(args.mac) == 'string') ? trim(args.mac) : '';
+			let ip = (type(args.ip) == 'string') ? trim(args.ip) : '';
+			if (length(split(mac, ':')) != 6)
+				return { error: 'invalid mac address' };
+			if (length(split(ip, '.')) != 4)
+				return { error: 'invalid ipv4 address' };
+
+			let ctx = cursor();
+			if (ctx == null)
+				return { error: 'uci unavailable' };
+
+			let name = (type(args.name) == 'string' && args.name != '') ? args.name : 'mcp-host';
+			let sect = ctx.add('dhcp', 'host', { name: name, mac: mac, ip: ip });
+			ctx.commit('dhcp');
+			run([ '/etc/init.d/dnsmasq', 'reload' ]);
+			return { ok: true, section: sect, name: name, mac: mac, ip: ip };
+		}
+	},
+
+	add_firewall_rule: {
+		desc: 'Add a firewall traffic rule. Requires confirm:true. High risk: may cut off access.',
+		write: true,
+		schema: {
+			type: 'object',
+			properties: {
+				name: { type: 'string', description: 'Rule name' },
+				proto: { type: 'string', description: 'tcp / udp / tcpudp / any' },
+				dest_port: { type: 'string', description: 'Destination port or range, e.g. 8080 or 1000-2000' },
+				src: { type: 'string', description: 'Source zone, e.g. wan / lan' },
+				target: { type: 'string', description: 'ACCEPT (default) / REJECT / DROP' },
+				confirm: { type: 'boolean', description: 'Must be true' }
+			},
+			required: [ 'name', 'confirm' ]
+		},
+		run: function(args) {
+			if (args.confirm !== true)
+				return { error: 'this operation requires arguments.confirm=true' };
+			if (type(args.name) != 'string' || args.name == '')
+				return { error: 'missing rule "name"' };
+
+			let ctx = cursor();
+			if (ctx == null)
+				return { error: 'uci unavailable' };
+
+			let vals = {
+				name: args.name,
+				target: (type(args.target) == 'string' && args.target != '') ? args.target : 'ACCEPT'
+			};
+			if (type(args.proto) == 'string' && args.proto != '')
+				vals.proto = args.proto;
+			if (type(args.dest_port) == 'string' && args.dest_port != '')
+				vals.dest_port = args.dest_port;
+			if (type(args.src) == 'string' && args.src != '')
+				vals.src = args.src;
+
+			let sect = ctx.add('firewall', 'rule', vals);
+			ctx.commit('firewall');
+			run([ '/etc/init.d/firewall', 'reload' ]);
+			return { ok: true, section: sect, name: args.name };
+		}
+	},
+
+	remove_firewall_rule: {
+		desc: 'Remove a firewall rule by its uci section name. Requires confirm:true.',
+		write: true,
+		schema: {
+			type: 'object',
+			properties: {
+				section: { type: 'string', description: 'uci section name of the firewall rule' },
+				confirm: { type: 'boolean', description: 'Must be true' }
+			},
+			required: [ 'section', 'confirm' ]
+		},
+		run: function(args) {
+			if (args.confirm !== true)
+				return { error: 'this operation requires arguments.confirm=true' };
+			if (type(args.section) != 'string' || args.section == '')
+				return { error: 'missing "section"' };
+
+			let ctx = cursor();
+			if (ctx == null)
+				return { error: 'uci unavailable' };
+			if (ctx.get('firewall', args.section) == null)
+				return { error: 'section "' + args.section + '" not found' };
+
+			ctx.delete('firewall', args.section);
+			ctx.commit('firewall');
+			run([ '/etc/init.d/firewall', 'reload' ]);
+			return { ok: true, removed: args.section };
+		}
+	},
+
+	restart_service: {
+		desc: 'Restart a whitelisted service: network / dnsmasq / firewall / wireless. Requires confirm:true.',
+		write: true,
+		schema: {
+			type: 'object',
+			properties: {
+				service: { type: 'string', description: 'network | dnsmasq | firewall | wireless' },
+				confirm: { type: 'boolean', description: 'Must be true' }
+			},
+			required: [ 'service', 'confirm' ]
+		},
+		run: function(args) {
+			if (args.confirm !== true)
+				return { error: 'this operation requires arguments.confirm=true' };
+			let svc = (type(args.service) == 'string') ? args.service : '';
+			let cmd = SERVICE_CMDS[svc];
+			if (cmd == null)
+				return { error: 'service not in whitelist (network | dnsmasq | firewall | wireless)' };
+			run(cmd);
+			return { ok: true, service: svc };
+		}
+	},
+
+	reboot: {
+		desc: 'Reboot the router. Requires confirm:true. The reply is sent before the reboot starts.',
+		write: true,
+		schema: {
+			type: 'object',
+			properties: {
+				confirm: { type: 'boolean', description: 'Must be true' }
+			},
+			required: [ 'confirm' ]
+		},
+		run: function(args) {
+			if (args.confirm !== true)
+				return { error: 'this operation requires arguments.confirm=true' };
+			/* hardcoded string, delayed so the HTTP response can be delivered */
+			fs.popen('/bin/sh -c "(sleep 2; /sbin/reboot) >/dev/null 2>&1 &"', 'r');
+			return { ok: true, note: 'reboot scheduled in 2 seconds' };
+		}
+	}
+};
+
+function tool_list() {
+	let out = [];
+	for (let name in tools) {
+		let t = tools[name];
+		push(out, {
+			name: name,
+			description: t.desc,
+			inputSchema: t.schema
+		});
+	}
+	return out;
+}
+
+/* ------------------------------------------------------------------ */
+/* JSON-RPC dispatch                                                  */
+/* ------------------------------------------------------------------ */
+
+function tools_call(params, id) {
+	if (type(params) != 'object')
+		return rpc_err(id, -32602, 'Invalid params');
+
+	let name = params.name;
+	let args = params.arguments;
+	if (type(name) != 'string' || tools[name] == null)
+		return rpc_err(id, -32602, 'Unknown tool: ' + (type(name) == 'string' ? name : ''));
+	if (args == null)
+		args = {};
+	if (type(args) != 'object')
+		return rpc_err(id, -32602, 'Invalid arguments');
+
+	let t = tools[name];
+	let argsum = truncate(sprintf('%J', args), 160);
+
+	if (t.write) {
+		if (!cfg.allow_write) {
+			audit('tool=' + name + ' DENIED allow_write=0 args=' + argsum);
+			return rpc_ok(id, tool_err('write tools are disabled on this router; enable with: uci set mcp.global.allow_write=1 && uci commit mcp'));
+		}
+		if (args.confirm !== true) {
+			audit('tool=' + name + ' DENIED missing-confirm args=' + argsum);
+			return rpc_ok(id, tool_err('this is a write operation and requires arguments.confirm=true'));
+		}
+	}
+
+	try {
+		let result = t.run(args);
+		/* normalize soft failures { error: '...' } into protocol-level errors */
+		if (type(result) == 'object' && result.error != null && result.ok == null) {
+			audit('tool=' + name + ' error=' + truncate(result.error, 120) + ' args=' + argsum);
+			return rpc_ok(id, tool_err(result.error));
+		}
+		audit('tool=' + name + ' ok args=' + argsum);
+		return rpc_ok(id, tool_ok(result));
+	} catch (e) {
+		audit('tool=' + name + ' error=' + truncate(e, 120) + ' args=' + argsum);
+		return rpc_ok(id, tool_err(e));
+	}
+}
+
+function handle_rpc(msg) {
+	if (type(msg) != 'object')
+		return rpc_err(null, -32600, 'Invalid Request');
+
+	let id = msg.id;
+	let method = msg.method;
+	let is_notification = (id === null);
+
+	if (type(method) != 'string')
+		return is_notification ? null : rpc_err(id, -32600, 'Invalid Request');
+
+	let result;
+
+	if (method == 'initialize') {
+		let params = msg.params;
+		let pv = (type(params) == 'object' && type(params.protocolVersion) == 'string') ?
+			params.protocolVersion : PROTOCOL_FALLBACK;
+		result = rpc_ok(id, {
+			protocolVersion: pv,
+			capabilities: { tools: {} },
+			serverInfo: { name: 'mcp-routerd', version: VERSION },
+			instructions: 'OpenWrt router management. Read-only tools are always available. Write tools (set_wifi, set_dhcp_lease, add/remove_firewall_rule, restart_service, reboot) require arguments.confirm=true and are only enabled when mcp.global.allow_write=1.'
+		});
+	}
+	else if (method == 'ping') {
+		result = rpc_ok(id, {});
+	}
+	else if (method == 'tools/list') {
+		result = rpc_ok(id, { tools: tool_list() });
+	}
+	else if (method == 'tools/call') {
+		result = tools_call(msg.params, id);
+	}
+	else if (index(method, 'notifications/') == 0) {
+		/* client notifications (initialized, cancelled, ...) -> no response */
+		return null;
+	}
+	else {
+		result = rpc_err(id, -32601, 'Method not found: ' + method);
+	}
+
+	return is_notification ? null : result;
+}
+
+/* ------------------------------------------------------------------ */
+/* HTTP layer                                                         */
+/* ------------------------------------------------------------------ */
+
+let REASONS = {
+	'200': 'OK',
+	'202': 'Accepted',
+	'204': 'No Content',
+	'400': 'Bad Request',
+	'401': 'Unauthorized',
+	'404': 'Not Found',
+	'405': 'Method Not Allowed',
+	'408': 'Request Timeout',
+	'413': 'Payload Too Large',
+	'431': 'Request Header Fields Too Large',
+	'500': 'Internal Server Error'
+};
+
+function send_all(conn, s) {
+	let off = 0;
+	let len = length(s);
+	while (off < len) {
+		let n = conn.send(substr(s, off));
+		if (n == null || n <= 0)
+			return false;
+		off += n;
+	}
+	return true;
+}
+
+function http_reply(conn, status, body, extra) {
+	if (body == null)
+		body = '';
+	let reason = REASONS['' + status];
+	if (reason == null)
+		reason = 'Unknown';
+
+	let hdrs = [
+		'HTTP/1.1 ' + status + ' ' + reason,
+		'Content-Type: application/json; charset=utf-8',
+		'Content-Length: ' + length(body),
+		'Connection: close',
+		'Cache-Control: no-store',
+		'Access-Control-Allow-Origin: *',
+		'Access-Control-Allow-Methods: POST, GET, OPTIONS',
+		'Access-Control-Allow-Headers: Authorization, Content-Type, Mcp-Protocol-Version, Accept'
+	];
+	if (type(extra) == 'array') {
+		for (let i = 0; i < length(extra); i++)
+			push(hdrs, extra[i]);
+	}
+	send_all(conn, join('\r\n', hdrs) + '\r\n\r\n' + body);
+}
+
+function read_request(conn) {
+	let buf = '';
+
+	/* header */
+	while (true) {
+		let hend = index(buf, '\r\n\r\n');
+		if (hend >= 0)
+			break;
+		if (length(buf) > MAX_HEADER)
+			return { status: 431 };
+		let ev = socket.poll(READ_TIMEOUT, conn);
+		if (type(ev) != 'array' || length(ev) == 0)
+			return { status: 408 };
+		if ((ev[0][1] & socket.POLLIN) == 0)
+			return { status: 408 };
+		let chunk = conn.recv(8192);
+		if (chunk == null || chunk == '')
+			return null;
+		buf += chunk;
+	}
+
+	let hend = index(buf, '\r\n\r\n');
+	let header_text = substr(buf, 0, hend);
+	let body_start = hend + 4;
+
+	let lines = split(header_text, '\r\n');
+	let reqline = length(lines) > 0 ? split(lines[0], ' ') : [];
+	let method = length(reqline) > 0 ? reqline[0] : '';
+	let path = length(reqline) > 1 ? reqline[1] : '/';
+
+	let headers = {};
+	for (let i = 1; i < length(lines); i++) {
+		let p = index(lines[i], ':');
+		if (p < 0)
+			continue;
+		headers[lc(trim(substr(lines[i], 0, p)))] = trim(substr(lines[i], p + 1));
+	}
+
+	/* body */
+	let clen = 0;
+	if (type(headers['content-length']) == 'string') {
+		clen = int(headers['content-length']);
+		if (!(clen >= 0))
+			clen = 0;
+	}
+	if (clen > MAX_BODY)
+		return { status: 413 };
+
+	while (length(buf) - body_start < clen) {
+		let ev = socket.poll(READ_TIMEOUT, conn);
+		if (type(ev) != 'array' || length(ev) == 0)
+			return { status: 408 };
+		if ((ev[0][1] & socket.POLLIN) == 0)
+			return { status: 408 };
+		let chunk = conn.recv(8192);
+		if (chunk == null || chunk == '')
+			return null;
+		buf += chunk;
+		if (length(buf) - body_start > MAX_BODY)
+			return { status: 413 };
+	}
+
+	return {
+		method: method,
+		path: path,
+		headers: headers,
+		body: clen > 0 ? substr(buf, body_start, clen) : ''
+	};
+}
+
+function serve_client(conn, peer) {
+	let req = read_request(conn);
+	if (req == null)
+		return;
+	if (req.status != null) {
+		http_reply(conn, req.status, sprintf('%J', { error: REASONS['' + req.status] }));
+		return;
+	}
+
+	let path = req.path;
+	let q = index(path, '?');
+	if (q >= 0)
+		path = substr(path, 0, q);
+
+	if (req.method == 'OPTIONS') {
+		http_reply(conn, 204, '');
+		return;
+	}
+
+	if (req.method != 'POST') {
+		http_reply(conn, 405, sprintf('%J', { error: 'use POST with a JSON-RPC body' }),
+			[ 'Allow: POST, OPTIONS' ]);
+		return;
+	}
+
+	if (path != '/mcp' && path != '/mcp/' && path != '/') {
+		http_reply(conn, 404, sprintf('%J', { error: 'not found' }));
+		return;
+	}
+
+	if (!auth_ok(req.headers)) {
+		log.syslog(log.LOG_WARNING, '%s', 'mcp-routerd: unauthorized request from ' + peer);
+		http_reply(conn, 401, sprintf('%J', { error: 'unauthorized' }),
+			[ 'WWW-Authenticate: Bearer realm="mcp-routerd"' ]);
+		return;
+	}
+
+	let parsed;
+	try {
+		parsed = json(req.body);
+	} catch (e) {
+		http_reply(conn, 200, sprintf('%J', rpc_err(null, -32700, 'Parse error')));
+		return;
+	}
+
+	if (type(parsed) == 'array') {
+		/* JSON-RPC batch */
+		let outs = [];
+		for (let i = 0; i < length(parsed); i++) {
+			let out = handle_rpc(parsed[i]);
+			if (out != null)
+				push(outs, out);
+		}
+		if (length(outs) == 0)
+			http_reply(conn, 202, '');
+		else
+			http_reply(conn, 200, sprintf('%J', outs));
+		return;
+	}
+
+	let out = handle_rpc(parsed);
+	if (out == null) {
+		/* notification -> accepted, no body */
+		http_reply(conn, 202, '');
+		return;
+	}
+	http_reply(conn, 200, sprintf('%J', out));
+}
+
+/* ------------------------------------------------------------------ */
+/* main                                                               */
+/* ------------------------------------------------------------------ */
+
+function main() {
+	log.openlog("mcp-routerd", log.LOG_PID, log.LOG_DAEMON);
+
+	load_config();
+	ensure_token();
+
+	if (!cfg.enabled) {
+		log.syslog(log.LOG_NOTICE, '%s', 'mcp-routerd: disabled by configuration');
+		return 0;
+	}
+
+	let parts = split(cfg.listen, ':');
+	if (length(parts) != 2)
+		die('mcp-routerd: invalid listen address: ' + cfg.listen);
+	let host = parts[0];
+	let port = int(parts[1]);
+	if (!(port >= 1 && port <= 65535))
+		die('mcp-routerd: invalid port in listen address: ' + cfg.listen);
+
+	let srv = socket.listen(host, port, null, 8, true);
+	if (srv == null)
+		die('mcp-routerd: cannot listen on ' + cfg.listen + ': ' + socket.error());
+
+	log.syslog(log.LOG_INFO, '%s', 'mcp-routerd v' + VERSION + ' listening on ' + cfg.listen +
+		' allow_write=' + (cfg.allow_write ? '1' : '0'));
+
+	while (true) {
+		let conn = srv.accept();
+		if (conn == null)
+			continue;
+		let peer = 'unknown';
+		try {
+			let pn = conn.peername();
+			if (type(pn) == 'object' && pn.address != null)
+				peer = pn.address;
+		} catch (e) { }
+		try {
+			serve_client(conn, peer);
+		} catch (e) {
+			log.syslog(log.LOG_ERR, '%s', 'mcp-routerd: handler exception: ' + truncate(e, 200));
+			try {
+				http_reply(conn, 500, sprintf('%J', { error: 'internal error' }));
+			} catch (e2) { }
+		}
+		conn.close();
+	}
+	return 0;
+}
+
+main();

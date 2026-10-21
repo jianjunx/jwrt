@@ -1,0 +1,21 @@
+# mcp-routerd - MCP endpoint for AI agents
+#
+# Included by the nginx-ssl _lan server (see: uci get nginx._lan.include).
+# Access is restricted to LAN addresses by restrict_locally; the endpoint
+# additionally requires a Bearer token (uci get mcp.global.token).
+
+location /mcp {
+	access_log off;
+
+	proxy_pass http://127.0.0.1:8765;
+	proxy_http_version 1.1;
+
+	proxy_set_header Host $host;
+	proxy_set_header X-Real-IP $remote_addr;
+	proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+	proxy_set_header X-Forwarded-Proto $scheme;
+	proxy_set_header Authorization $http_authorization;
+
+	proxy_read_timeout 300s;
+	proxy_buffering off;
+}
