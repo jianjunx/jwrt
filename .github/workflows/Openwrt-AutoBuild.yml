@@ -10,6 +10,16 @@ name: Build OpenWrt
 
 on: 
   repository_dispatch:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 'build target'
+        required: false
+        default: 'mediatek_filogic'
+      param:
+        description: 'extra params (nocache etc.)'
+        required: false
+        default: 'nocache'
 
 env:
   REPO_TOKEN: ${{ secrets.TOKEN_KIDDIN9 }}
@@ -31,7 +41,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: ["${{ github.event.client_payload.target }}"]
+        target: ["${{ github.event.client_payload.target || github.event.inputs.target || 'mediatek_filogic' }}"]
         
     steps:
     - name: Checkout
@@ -220,7 +230,7 @@ jobs:
       with:
         ccache: 'false'
         mixkey: ${{ matrix.target }}
-        clean: ${{ contains(github.event.action, 'nocache') }}
+        clean: ${{ contains(github.event.action, 'nocache') || github.event.inputs.param == 'nocache' }}
         prefix: ${{ github.workspace }}/openwrt
 
     - name: SSH connection to Actions
